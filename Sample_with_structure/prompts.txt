@@ -1,0 +1,60 @@
+Can you analyze this controller methods and explain me the functionality of it (non technical)? 
+Also list high level business logic and DB tables used here (with details in tabular form) in the related Model
+
+Here is the model file, please list DB tables (with details of Table / Model, Purpose in controller, Key columns in tabular form) used here for the above / previous controller you analyse 
+
+extract the exact column names and associations from the Sequelize model files under src/v3_0_1/models and present a concrete schema (table names and field lists).
+open the bulkMessages query model to show the exact DB queries used to create broadcasts and jobs.
+
+
+=====
+can you review this helper file and create similar helper in helpers\accounts\accountHelper.js for controllers\accounts\accountsController.js which is using models\queryModels\accounts\account.js for DB interaction
+
+
+can you review this Account.js model file and create a helper to validate request using 'joi' in helpers\accounts\accountHelper.js for controllers\accounts\accountsController.js which is using models\queryModels\accounts\account.js for DB interaction
+
+include below modules in your code:
+const Joi = require("joi");
+const { checkOpKeys } = require('../common/searchOpKeys');
+const logger = require('../../../logger/logger');
+const { getName } = require('../../../logger/logFunctionName');
+
+for error logging / tracking execution, use code like below
+at beginning of method:  logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+before returning: logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+return ({ "status": 200, "success": true, "data": data });
+
+for any error (don't use  logger.warn) instead follow below example
+logger.error(`*** ${errors} in %s of %s ***`, getName().functionName, getName().fileName);
+return ({ "status": 400, "success": false, "message": errors });
+Or (for error caught in catch block): 
+logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+logger.error(err.message || JSON.stringify(err));
+next({ "status": 500, "success": false, "message": "Something went wrong" });
+
+--------------------------------
+
+can you update the code in AccountsController.js to use helper methods in helpers\accounts\accountHelper.js ?
+
+-----------------------------------
+
+can you review listInvoices method and implement similar filter, sort, pagination logic in models\queryModels\accounts\account.js listAccounts method ?
+
+------------------------------
+
+please review the attached files (controllers\accounts\AccountsController.js, helpers\accounts\accountHelper.js, models\Account.js, models\queryModels\accounts\account.js) and tell me if validation, error handling, sending response are ok or not
+
+can you implement all the recommendations you mentioned above in related files? 
+
+
+please create / update router (api end point) for account controller
+
+?filter_op={"search_attr":"substring"}
+&filters={"offset":0,"limit":10,"search_attr":"Acme"}
+
+?filters={"offset":0,"limit":10,"created_at":["2025-11-11","2025-11-11"]}
+
+?filters={"offset":0,"limit":10,"created_at":["2025-11-11","2025-11-11"],"search_attr":"Indus"}
+&filter_op={"created_at":"between","search_attr":"substring"}
+
+?filters={"offset":0,"limit":10,"sorting":[{"sort":"desc","colId":"created_at"}],"account_type":"individual"}
