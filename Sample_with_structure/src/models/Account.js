@@ -59,7 +59,6 @@ module.exports = sequelize.define('Account', {
     created_at: {
         type: Sequelize.DATE,
         allowNull: true,
-        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP')
     },
     org_id: {
         type: Sequelize.INTEGER,
@@ -71,11 +70,17 @@ module.exports = sequelize.define('Account', {
     },
     createdAt: {
         type: Sequelize.DATE,
-        allowNull: true
+        allowNull: true,
+        defaultValue: Sequelize.literal('CURRENT_TIMESTAMP')
     },
     updatedAt: {
         type: Sequelize.DATE,
         allowNull: true
+    },
+    deleted_flag: {
+        type: Sequelize.TINYINT(2),
+        allowNull: true,
+        defaultValue: 0
     }
 }, {
     tableName: 'accounts',

@@ -4,7 +4,9 @@ const {
     getAccountById,
     updateAccount,
     deleteAccount,
-    accountData
+    softDeleteAccount,
+    accountData,
+    setPrimaryContact
 } = require("../../models/queryModels/accounts/account");
 
 const {
@@ -28,10 +30,17 @@ const { getName } = require('../../../logger/logFunctionName');
 exports.searchWithAccount = async (req, res, next) => {
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
     try {
+        let currentCognitoUserDetails = req.currentUser;
+        let userParams = JSON.parse(currentCognitoUserDetails['custom:user_details']);
+        let user_id = userParams.user_id;
+        let org_id = userParams.org_id;
+        let user_type = userParams.user_type;
+
         // Validate query parameters using helper
         const validation = validateSearchQuery({
             name: req.query.name,
-            limit: req.query.limit
+            limit: req.query.limit,
+            deleted_flag: req.query.deleted_flag
         });
         
         if (!validation.success) {
@@ -42,9 +51,9 @@ exports.searchWithAccount = async (req, res, next) => {
             });
         }
 
-        const { name: q, limit } = validation.data;
+        const { name: q, limit, deleted_flag } = validation.data;
 
-        const result = await accountData(q, limit, next);
+        const result = await accountData(q, org_id, user_id, user_type, limit, deleted_flag, next);
         
         if (!result.success) {
             logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
@@ -129,6 +138,7 @@ exports.createAccount = async (req, res, next) => {
 
 // List accounts
 exports.listAccounts = async (req, res, next) => {
+    console.log("****************************************************Entered listAccounts controller");
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
     try {
         const currentCognitoUserDetails = req.currentUser;
@@ -136,35 +146,31 @@ exports.listAccounts = async (req, res, next) => {
         let org_id = userParams.org_id;
         let user_id = userParams.user_id;
         let user_type = userParams.user_type;
-
-        // Parse filters from query string
+        
         let params = {};
-        if (req.query.filters) {
+        
+        // Support query string parameters (filter and filter_op separately)
+        if (req.query.filters || req.query.filter_op) {
             try {
-                params = JSON.parse(req.query.filters);
+                if (req.query.filters) {
+                    params.filter = JSON.parse(req.query.filters);
+                }
+                if (req.query.filter_op) {
+                    params.filter_op = JSON.parse(req.query.filter_op);
+                }
             } catch (e) {
-                logger.error("*** Invalid filters JSON in %s of %s ***", getName().functionName, getName().fileName);
+                logger.error("Failed to parse filter/filter_op: %s", e.message);
                 return res.status(400).json({ 
                     success: false, 
-                    message: 'Invalid filters format. Must be valid JSON.' 
+                    message: 'Invalid filter/filter_op format' 
                 });
             }
-        } else {
-            // Use query params directly if no filters object
-            params = { ...req.query };
+        } else if (req.body && Object.keys(req.body).length > 0) {
+            // Support body params
+            params = req.body;
         }
-
-        // Validate search parameters using helper
-        const validation = validateSearchAccount(params);
-        if (!validation.success) {
-            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
-            return res.status(validation.status).json({ 
-                success: false, 
-                message: validation.message 
-            });
-        }
-
-        const accountData = await listAccounts(validation.data, org_id, user_id, user_type, next);
+        
+        const accountData = await listAccounts(params, org_id, user_id, user_type, next);
         
         if (!accountData.success) {
             logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
@@ -182,6 +188,58 @@ exports.listAccounts = async (req, res, next) => {
         });
 
     } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        return res.status(500).json({ 
+            success: false, 
+            message: "Something went wrong" 
+        });
+    }
+};
+
+// List accounts with helper validation
+exports.listAccountsHelper = async (req, res, next) => {
+    console.log("****************************************************Entered listAccountsHelper controller");
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        const currentCognitoUserDetails = req.currentUser;
+        let userParams = JSON.parse(currentCognitoUserDetails['custom:user_details']);
+        let org_id = userParams.org_id;
+        let user_id = userParams.user_id;
+        let user_type = userParams.user_type;
+        
+        // Validate request using helper
+        const validation = await validateSearchAccount(req.query);
+        
+        if (!validation.success) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(validation.status || 400).json({ 
+                success: false, 
+                message: validation.message 
+            });
+        }
+
+        const params = validation.data;
+        
+        const accountData = await listAccounts(params, org_id, user_id, user_type, next);
+        
+        if (!accountData.success) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(accountData.status || 400).json({ 
+                success: false, 
+                message: accountData.message || 'Failed to fetch accounts' 
+            });
+        }
+
+        logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+        return res.json({ 
+            success: true, 
+            total: accountData.total || 0, 
+            data: accountData.data 
+        });
+
+    } catch (error) {
+        console.error('Stack trace:', error.stack);
         logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
         logger.error(error.message || JSON.stringify(error));
         return res.status(500).json({ 
@@ -352,6 +410,101 @@ exports.deleteAccount = async (req, res, next) => {
         return res.json({ 
             success: true, 
             message: accountData.message || 'Account deleted successfully' 
+        });
+
+    } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        return res.status(500).json({ 
+            success: false, 
+            message: "Something went wrong" 
+        });
+    }
+};
+
+// Soft delete account
+exports.softDeleteAccount = async (req, res, next) => {
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        const currentCognitoUserDetails = req.currentUser;
+        let userParams = JSON.parse(currentCognitoUserDetails['custom:user_details']);
+        let org_id = userParams.org_id;
+        let user_id = userParams.user_id;
+        
+        // Validate account ID using helper
+        const validation = validateAccountId(req.params);
+        if (!validation.success) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(validation.status).json({ 
+                success: false, 
+                message: validation.message 
+            });
+        }
+
+        const accountId = validation.data.id;
+
+        const accountData = await softDeleteAccount(accountId, org_id, user_id, next);
+        
+        if (!accountData.success) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(accountData.status || 400).json({ 
+                success: false, 
+                message: accountData.message || 'Failed to soft delete account' 
+            });
+        }
+
+        logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+        return res.json({ 
+            success: true, 
+            message: accountData.message || 'Account soft deleted successfully',
+            data: accountData.data
+        });
+
+    } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        return res.status(500).json({ 
+            success: false, 
+            message: "Something went wrong" 
+        });
+    }
+};
+
+// Set primary contact for account
+exports.setPrimaryContact = async (req, res, next) => {
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        const currentCognitoUserDetails = req.currentUser;
+        let userParams = JSON.parse(currentCognitoUserDetails['custom:user_details']);
+        let org_id = userParams.org_id;
+        let user_id = userParams.user_id;
+        
+        // Validate required fields
+        const { account_id, customer_id } = req.body;
+        
+        if (!account_id || !customer_id) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'account_id and customer_id are required' 
+            });
+        }
+
+        const result = await setPrimaryContact({ account_id, customer_id }, org_id, user_id, next);
+        
+        if (!result.success) {
+            logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+            return res.status(result.status || 400).json({ 
+                success: false, 
+                message: result.message || 'Failed to set primary contact' 
+            });
+        }
+
+        logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+        return res.json({ 
+            success: true, 
+            message: result.message || 'Primary contact set successfully',
+            data: result.data
         });
 
     } catch (error) {

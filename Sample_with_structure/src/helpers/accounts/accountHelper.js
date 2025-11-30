@@ -34,7 +34,12 @@ const createAccountSchema = Joi.object({
     source: Joi.string().max(100).allow(null, '').optional(),
     created_by: Joi.number().integer().positive().allow(null).optional(),
     org_id: Joi.number().integer().positive().allow(null).optional(),
-    account_type: Joi.string().max(100).allow(null, '').optional()
+    account_type: Joi.string().max(100).allow(null, '').optional(),
+    customer_id: Joi.number().integer().positive().allow(null).optional()
+        .messages({
+            'number.base': 'Customer ID must be a number',
+            'number.positive': 'Customer ID must be a positive number'
+        })
 });
 
 /**
@@ -96,7 +101,8 @@ const searchQuerySchema = Joi.object({
             'number.base': 'Limit must be a number',
             'number.min': 'Limit must be at least 1',
             'number.max': 'Limit cannot exceed 100'
-        })
+        }),
+    deleted_flag: Joi.allow(null).optional()    
 });
 
 /**
@@ -272,31 +278,73 @@ const validateSearchQuery = (query) => {
  * @param {Object} query - Request query parameters
  * @returns {Object} - Validation result
  */
-const validateSearchAccount = (query) => {
+const validateSearchAccount = async (query) => {
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
     
     try {
-        // Check for search operation keys if using advanced search
-        const hasSearchOps = checkOpKeys(query);
+        let filters = query.filters || null;
+        let filter_op = query.filter_op || null;
+        let result = {};
+        let data_hash = {};
         
-        const { error, value } = searchAccountSchema.validate(query, { 
+        // Parse filters if provided
+        if (filters) {
+            let filters_obj = JSON.parse(filters);
+            let filter_arr = Object.keys(filters_obj);
+            let filter = {};
+            filter_arr.forEach(e => {
+                filter[e] = filters_obj[e];
+            });
+            if (Object.keys(filter).length > 0) {
+                data_hash["filter"] = filter;
+            }
+        }
+        
+        // Parse and validate filter_op if provided
+        if (filter_op) {
+            let filter_op_obj = JSON.parse(filter_op);
+            var isPassedOpKeys = await checkOpKeys(Object.values(filter_op_obj));
+            if (!isPassedOpKeys.success) {
+                result = {
+                    "success": false,
+                    "message": isPassedOpKeys.message
+                };
+                logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
+                return { status: 400, success: false, message: isPassedOpKeys.message };
+            }
+            if (Object.keys(filter_op_obj).length > 0) {
+                data_hash["filter_op"] = filter_op_obj;
+            }
+        }
+        
+        // Add other query parameters to data_hash
+        if (query.page) data_hash["page"] = query.page;
+        if (query.limit) data_hash["limit"] = query.limit;
+        if (query.sort) data_hash["sort"] = query.sort;
+        if (query.order) data_hash["order"] = query.order;
+        
+        // Validate with schema if filter exists
+        if (data_hash?.filter && Object.keys(data_hash?.filter).length > 0) {
+            const { error, value } = searchAccountSchema.validate(data_hash.filter, { 
             abortEarly: false,
             stripUnknown: false 
         });
         
         if (error) {
-            const errors = error.details.map(detail => ({
-                field: detail.path.join('.'),
-                message: detail.message
-            }));
-            logger.error(`*** ${JSON.stringify(errors)} in %s of %s ***`, getName().functionName, getName().fileName);
+                logger.error(`*** ${error.details[0].message} in %s of %s ***`, getName().functionName, getName().fileName);
             logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
-            return { status: 400, success: false, message: errors };
+                return { status: 400, success: false, message: error.details[0].message };
+        }
         }
         
+        result = {
+            "success": true,
+            "data": data_hash
+        };
         logger.info("* Ending %s of %s *", getName().functionName, getName().fileName);
-        return { status: 200, success: true, data: { ...value, hasSearchOps } };
+        return result;
     } catch (err) {
+        console.error('Stack trace:', err.stack);
         logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
         logger.error(err.message || JSON.stringify(err));
         return { status: 500, success: false, message: "Something went wrong" };

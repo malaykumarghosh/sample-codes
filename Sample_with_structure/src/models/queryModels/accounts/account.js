@@ -3,6 +3,8 @@ const db = require('../../index');
 const { Op } = require("sequelize");
 const logger = require('../../../../logger/logger');
 const { getName } = require('../../../../logger/logFunctionName');
+const { order } = require("../../../../universal/modules/notifications/templates");
+
 
 // Define all associations
 db.Organisation.hasMany(db.Account, { foreignKey: 'org_id', as: 'OrgAccountRelation' });
@@ -14,10 +16,9 @@ db.Customer.belongsTo(db.Account, { foreignKey: 'account_id', as: 'CustomerAccRe
 db.Account.belongsTo(db.User, { foreignKey: 'created_by', as: 'AccountUserRelation' });
 db.User.hasMany(db.Account, { foreignKey: 'created_by', as: 'UserAccountRelation' });
 
-db.Account.hasMany(db.Invoice, { foreignKey: 'account_id', as: 'AccountInvoiceRelation' });
-db.Invoice.belongsTo(db.Account, { foreignKey: 'account_id', as: 'InvoiceAccountRelation' });
 
-exports.accountData = async (q, limit, next) => {
+exports.accountData = async (q, org_id, user_id, user_type, limit, deleted_flag, next) => {
+
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
     try {
         // Validate and sanitize the search query
@@ -33,13 +34,11 @@ exports.accountData = async (q, limit, next) => {
         
         const accounts = await db.Account.findAll({
             where: {
-                [Op.or]: [
-                    { name: { [Op.like]: `%${sanitizedQuery}%` } },
-                    { email: { [Op.like]: `%${sanitizedQuery}%` } },
-                    { phone_number: { [Op.like]: `%${sanitizedQuery}%` } }
-                ]
+                name: { [Op.like]: `%${sanitizedQuery}%` },
+                org_id: org_id,
+                deleted_flag: deleted_flag !== undefined ? deleted_flag : 0
             },
-            attributes: ['id', 'name', 'address', 'phone_number', 'email', 'city', 'state', 'country', 'postal_code'],
+            attributes: ['id', 'name', 'address', 'phone_number', 'email', 'city', 'state', 'country', 'postal_code', 'createdAt'],
             include: [
                 {
                     model: db.Organisation,
@@ -50,12 +49,31 @@ exports.accountData = async (q, limit, next) => {
                 {
                     model: db.Customer,
                     as: 'AccountCustomerRelation',
-                    attributes: ['id', 'name', 'email', 'phone_number', 'address1', 'address2', 'address3'],
-                    required: false
+                    attributes: ['id', 'name', 'email', 'phone_number', 'address1', 'address2', 'address3', 'is_primary_account_contact'],
+                    required: false,
+                    include: user_type == "user" ? [
+                        {
+                            // 2) Only customers whose CRM satisfies:
+                            //    assigned_org_user = userId OR assigned_org_user IS NULL
+                            model: db.Crm,
+                            as: 'CustomerCrm',
+                            required: true, // ensures customer has at least one such CRM row
+                            attributes: [],  // we don't need CRM fields in the result, just for filtering
+                            where: {
+                                [Op.or]: [
+                                    { assigned_org_user: user_id }, // e.g. current user's org user id
+                                    { assigned_org_user: null }
+                                ]
+                            }
+                        }
+                    ] : []
+                   
                 }
             ],
-            order: [['name', 'ASC']],
-            limit,
+            order: [['name', 'ASC'],
+         [{ model: db.Customer, as: 'AccountCustomerRelation' }, 'is_primary_account_contact', 'DESC']
+        ],
+            limit,distinct:true,
             benchmark: true,
             logging: (sql, timing) => console.log('[SEQUELIZE]', sql, timing ? `${timing}ms` : '')
         });
@@ -80,7 +98,8 @@ exports.accountData = async (q, limit, next) => {
                 phone: customer.phone_number,
                 address1: customer.address1,
                 address2: customer.address2,
-                address3: customer.address3
+                address3: customer.address3,
+                is_primary_account_contact: customer.is_primary_account_contact
             })) : []
         }));
 
@@ -119,10 +138,36 @@ exports.createAccount = async (params, org_id, user_id, next) => {
             account_type: params.account_type || null,
             org_id: org_id,
             created_by: user_id,
-            created_at: Sequelize.literal('CURRENT_TIMESTAMP')
+            created_at: new Date(),
+            createdAt: Sequelize.literal('CURRENT_TIMESTAMP'),
+            updatedAt: Sequelize.literal('CURRENT_TIMESTAMP')
         };
 
         const result = await db.Account.create(accountData);
+
+        console.log("+++++++++++++++++++++++++++++New account params:", params);
+        
+        // If customer_id is provided, link the customer to this account
+        if (params.customer_id) {
+            const [updatedCount] = await db.Customer.update(
+                {
+                    account_id: result.id,
+                    updatedAt: Sequelize.literal('CURRENT_TIMESTAMP')
+                },
+                {
+                    where: {
+                        id: params.customer_id,
+                        org_id: org_id
+                    }
+                }
+            );
+
+            if (updatedCount > 0) {
+                logger.info("Customer %s linked to account %s", params.customer_id, result.id);
+            } else {
+                logger.warn("Customer with id %s not found for org %s", params.customer_id, org_id);
+            }
+        }
 
         logger.info("*** Ending %s of %s ***", getName().functionName, getName().fileName);
         return {
@@ -143,7 +188,7 @@ exports.createAccount = async (params, org_id, user_id, next) => {
 };
 
 // List Accounts
-exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
+exports.listAccounts_old_bkp = async (params, org_id, user_id, user_type, next) => {
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
     try {
         logger.info("*** User type: %s ***", user_type);
@@ -156,7 +201,7 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
         
         // If not admin, filter by user_id (created_by)
         if (user_type !== 'admin') {
-            whereClause.created_by = user_id;
+           // whereClause.created_by = user_id;
         }
         
         // Add filters if provided
@@ -199,12 +244,6 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
                                     Sequelize.literal(
                                         `CONCAT(
                                             IFNULL(LOWER(Account.name), ' '), 
-                                            IFNULL(LOWER(Account.email), ' '), 
-                                            IFNULL(LOWER(Account.phone_number), ' '), 
-                                            IFNULL(LOWER(Account.address), ' '),
-                                            IFNULL(LOWER(Account.city), ' '),
-                                            IFNULL(LOWER(Account.state), ' '),
-                                            IFNULL(LOWER(Account.country), ' '),
                                             IFNULL(LOWER(Account.industry), ' '),
                                             IFNULL(LOWER(Account.account_type), ' ')
                                         )`
@@ -221,6 +260,13 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
             
         }
 
+        // ,
+        // IFNULL(LOWER(Account.email), ' '), 
+        // IFNULL(LOWER(Account.phone_number), ' '), 
+        // IFNULL(LOWER(Account.address), ' '),
+        // IFNULL(LOWER(Account.city), ' '),
+        // IFNULL(LOWER(Account.state), ' '),
+        // IFNULL(LOWER(Account.country), ' '),
         console.log("+++++++++++++++++++++++++++++++++++++++++++++++++++listAccounts - whereClause:", userWhereArr, whereClause);
 
         // Prepare query options
@@ -229,7 +275,7 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
                 ? { [Op.and]: [userWhereArr, whereClause] } 
                 : whereClause,
             attributes: { 
-                exclude: ['createdAt', 'updatedAt']
+                exclude: ['updatedAt']
             },
             // Add includes for organization, user, customers, and invoices
             include: [
@@ -249,8 +295,27 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
                     model: db.Customer,
                     as: 'AccountCustomerRelation',
                     attributes: ['id', 'name', 'email', 'phone_number'],
-                    where: { is_deleted: false },
-                    required: false
+                    required: false,
+                    include: [ 
+                        {
+                            required: user_type == "user" ? true : false,
+                            model: db.Crm,
+                            attributes: { exclude: ['createdAt', 'updatedAt', 'created_by'] },
+                            as: 'CustomerCrm',
+                            where: user_type == "user" ? {
+                                            [Op.or]: [
+                                                { assigned_org_user: user_id },
+                                                { assigned_org_user: null }
+                                            ]
+                                        } : undefined,
+                            include: {
+                                required: false,
+                                model: db.User,
+                                attributes: { exclude: ['createdAt', 'updatedAt', 'created_by'] },
+                                as: 'CrmUser'
+                            }
+                        }
+                ]
                 },
                 {
                     model: db.Invoice,
@@ -258,6 +323,7 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
                     attributes: ['id', 'invoice_ref', 'invoice_type', 'billing_date', 'billing_information'],
                     required: false
                 }
+               
             ]
         };
 
@@ -295,7 +361,7 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
         
         // Default sorting if none provided
         if (orderArray.length === 0) {
-            orderArray.push(['created_at', 'DESC']);
+            orderArray.push(['createdAt', 'DESC']);
         }
         
         queryOptions.order = orderArray;
@@ -360,6 +426,308 @@ exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
     }
 };
 
+exports.listAccounts = async (params, org_id, user_id, user_type, next) => {
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        logger.info("*** User type: %s ***", user_type);
+        console.log("==============================Entering the function : listAccounts");
+        console.log("params:", JSON.stringify(params, null, 2));
+
+        // Base WHERE: always scoped by org
+        const whereClause = { org_id };
+        let userWhereArr = []; // for search_attr-based condition
+
+        // ---------------------------------------------------------------------
+        // ❌ OLD ACCESS CONTROL (REMOVED):
+        // if (user_type !== 'admin') {
+        //     whereClause.created_by = user_id;
+        // }
+        //
+        // ✅ New permission logic will be added via permissionCondition.
+        // ---------------------------------------------------------------------
+
+        // -----------------------------
+        // Filters from params.filter
+        // -----------------------------
+        if (params.filter) {
+            // Simple equality filters on Account fields
+            if (Object.keys(params.filter).length > 0) {
+                let filterKeys = Object.keys(params.filter);
+                let Account = db.Account.rawAttributes;
+                Account = Object.keys(Account);
+                
+                filterKeys.forEach(filterKey => {
+                    // Skip offset, limit, search_attr and sorting - handled separately
+                    if (!['offset', 'limit', 'search_attr', 'sorting'].includes(filterKey)) {
+                        if (Account.includes(filterKey)) {
+                            whereClause[filterKey] = params.filter[filterKey];
+                        }
+                    }
+                });
+            }
+            
+            // Operator-based filters and search_attr
+            if (params.filter_op) {
+                if (Object.keys(params.filter_op).length > 0) {
+                    let filter_op = params.filter_op;
+                    let filter_op_keys = Object.keys(params.filter_op);
+                    
+                    filter_op_keys.forEach(filterOpKey => {
+                        if (!['offset', 'limit', 'search_attr', 'sorting'].includes(filterOpKey)) {
+                            // Apply operator-based filters (gte, lte, between, etc.)
+                            whereClause[filterOpKey] = { 
+                                [Op[filter_op[filterOpKey]]]: params.filter[filterOpKey] 
+                            };
+                        }
+                        
+                        if (filterOpKey === "search_attr") {
+                            // search over name, industry, account_type
+                            let searchStr = params.filter[filterOpKey].replace(/_/g, '\\_');
+                            userWhereArr = [
+                                Sequelize.where(
+                                    Sequelize.literal(
+                                        `CONCAT(
+                                            IFNULL(LOWER(Account.name), ' '), 
+                                            IFNULL(LOWER(Account.industry), ' '),
+                                            IFNULL(LOWER(Account.account_type), ' ')
+                                        )`
+                                    ), 
+                                    {
+                                        [Op[filter_op[filterOpKey]]]: searchStr.toLowerCase()
+                                    }
+                                )
+                            ];
+                        }
+                    });
+                }
+            }
+        }
+
+        console.log("+++++++++++++++++++++++++++++++++++++++++++++++++++listAccounts - whereClause:", userWhereArr, whereClause);
+
+        // ---------------------------------------------------------------------
+        // NEW: CRM-BASED ACCESS CONTROL LOGIC FOR NON-ADMIN USERS
+        // ---------------------------------------------------------------------
+        let permissionCondition = null;
+
+        if (user_type !== 'admin') {
+            /**
+             * Non-admin visibility rules:
+             *
+             * A. Orphaned Accounts
+             *    - Account has NO customers in `customers` table.
+             *
+             * B. Direct CRM Association
+             *    - Account has customers AND
+             *    - At least one customer has this user as CRM in `crms.assigned_org_user`.
+             *
+             * C. Unassigned Accounts
+             *    - Account has customers AND
+             *    - None of those customers has ANY CRM row in `crms`.
+             *
+             * Excluded explicitly:
+             *    - Account has customers,
+             *    - current user is not CRM on any of them,
+             *    - and at least one customer has some other CRM.
+             *
+             * We encode A ∨ B ∨ C as a single SQL boolean expression.
+             *
+             * Tables:
+             *   - customers  (db.Customer → "customers")
+             *   - crms       (db.Crm      → "crms")
+             * Columns:
+             *   - customers.account_id
+             *   - customers.phone_number
+             *   - crms.customer_phone_number
+             *   - crms.assigned_org_user
+             *   - crms.org_id
+             */
+            const safeUserId = parseInt(user_id, 10);
+
+            permissionCondition = Sequelize.literal(`
+                (
+                    -- 1. Orphaned Accounts: no customers under this account
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM customers AS cu
+                        WHERE cu.account_id = Account.id
+                    )
+                    OR
+                    -- 2. Direct CRM Association: at least one customer with this user as CRM
+                    EXISTS (
+                        SELECT 1
+                        FROM customers AS cu
+                        INNER JOIN crms AS crm
+                            ON crm.customer_phone_number = cu.phone_number
+                           AND crm.org_id = ${org_id}
+                        WHERE cu.account_id = Account.id
+                          AND crm.assigned_org_user = ${safeUserId}
+                    )
+                    OR
+                    -- 3. Unassigned Accounts:
+                    --    has customers but none of them has ANY CRM row
+                    (
+                        EXISTS (
+                            SELECT 1
+                            FROM customers AS cu
+                            WHERE cu.account_id = Account.id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM customers AS cu
+                            INNER JOIN crms AS crm
+                                ON crm.customer_phone_number = cu.phone_number
+                               AND crm.org_id = ${org_id}
+                            WHERE cu.account_id = Account.id
+                        )
+                    )
+                )
+            `);
+        }
+
+        // ---------------------------------------------------------------------
+        // BUILD FINAL WHERE CLAUSE
+        // ---------------------------------------------------------------------
+        const andConditions = [whereClause];
+
+        if (userWhereArr && userWhereArr.length > 0) {
+            // userWhereArr is an array of Sequelize.where conditions
+            andConditions.push(...userWhereArr);
+        }
+
+        if (permissionCondition) {
+            andConditions.push(permissionCondition);
+        }
+
+        const finalWhere =
+            andConditions.length > 1
+                ? { [Op.and]: andConditions }
+                : andConditions[0];
+
+        // -----------------------------
+        // Prepare query options
+        // -----------------------------
+        const queryOptions = {
+            where: finalWhere,
+            attributes: { 
+                exclude: ['updatedAt']
+            },
+            include: [
+                {
+                    model: db.Organisation,
+                    as: 'AccountOrgRelation',
+                    attributes: ['id', 'name'],
+                    required: false
+                },
+                {
+                    model: db.User,
+                    as: 'AccountUserRelation',
+                    attributes: ['id', 'first_name', 'last_name'],
+                    required: false
+                },
+                {
+                    model: db.Customer,
+                    as: 'AccountCustomerRelation',
+                    attributes: ['id', 'name', 'email', 'phone_number'],
+                    required: false
+                },
+                {
+                    model: db.Invoice,
+                    as: 'AccountInvoiceRelation',
+                    attributes: ['id', 'invoice_ref', 'invoice_type', 'billing_date', 'billing_information'],
+                    required: false
+                }
+            ]
+        };
+
+        // Pagination
+        if (params.filter && params.filter.hasOwnProperty('offset') && params.filter.hasOwnProperty('limit')) {
+            let offset = typeof params.filter.offset === 'string' ? parseInt(params.filter.offset, 10) : params.filter.offset;
+            let limit  = typeof params.filter.limit === 'string' ? parseInt(params.filter.limit, 10) : params.filter.limit;
+            queryOptions.offset = offset;
+            queryOptions.limit  = Math.min(limit, 100); // Max 100
+        } else if (params.offset !== undefined && params.limit !== undefined) {
+            // Legacy support
+            queryOptions.offset = parseInt(params.offset, 10);
+            queryOptions.limit  = Math.min(parseInt(params.limit, 10), 100); // Max 100
+        }
+
+        // Sorting (Account columns only)
+        const orderArray = [];
+        if (params.filter && params.filter.sorting && Array.isArray(params.filter.sorting)) {
+            params.filter.sorting.forEach(sortConfig => {
+                if (sortConfig.colId && sortConfig.sort) {
+                    const column    = sortConfig.colId;
+                    const direction = sortConfig.sort.toUpperCase();
+                    orderArray.push([column, direction]);
+                }
+            });
+        }
+        
+        if (orderArray.length === 0) {
+            orderArray.push(['createdAt', 'DESC']);
+        }
+        
+        queryOptions.order = orderArray;
+
+        // Enable SQL logging and benchmarking
+        queryOptions.benchmark = true;
+        queryOptions.logging = (sql, timing) => {
+            console.log('[SEQUELIZE]', sql, timing ? `${timing}ms` : '');
+        };
+
+        console.log("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++listAccounts - queryOptions:", JSON.stringify(queryOptions, null, 2));
+
+        // Run data + count in parallel (count uses same finalWhere)
+        const [accounts, total] = await Promise.all([
+            db.Account.findAll(queryOptions),
+            db.Account.count({ where: finalWhere })
+        ]);
+
+        // Post-processing: add full_address, customer_count, invoice_count
+        const accountsWithCalculations = accounts.map(account => {
+            const accountJson = account.toJSON();
+            
+            accountJson.full_address = [
+                accountJson.address,
+                accountJson.city,
+                accountJson.state,
+                accountJson.country,
+                accountJson.postal_code
+            ].filter(Boolean).join(', ');
+            
+            accountJson.customer_count = accountJson.AccountCustomerRelation
+                ? accountJson.AccountCustomerRelation.length
+                : 0;
+            
+            accountJson.invoice_count = accountJson.AccountInvoiceRelation
+                ? accountJson.AccountInvoiceRelation.length
+                : 0;
+            
+            return accountJson;
+        });
+
+        logger.info("*** Ending %s of %s ***", getName().functionName, getName().fileName);
+        return {
+            success: true,
+            data: accountsWithCalculations,
+            total,
+            offset: queryOptions.offset || 0,
+            limit: queryOptions.limit || 10
+        };
+
+    } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        console.error("Full error:", error);
+        return { 
+            success: false, 
+            message: error.message || "Failed to fetch accounts", 
+            status: 500 
+        };
+    }
+};
+
 // Get Account by ID
 exports.getAccountById = async (accountId, org_id, user_type, next) => {
     logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
@@ -372,7 +740,7 @@ exports.getAccountById = async (accountId, org_id, user_type, next) => {
         const account = await db.Account.findOne({
             where: whereClause,
             attributes: { 
-                exclude: ['createdAt', 'updatedAt']
+                exclude: ['updatedAt']
             },
             include: [
                 {
@@ -384,7 +752,7 @@ exports.getAccountById = async (accountId, org_id, user_type, next) => {
                 {
                     model: db.Customer,
                     as: 'AccountCustomerRelation',
-                    attributes: ['id', 'name', 'email', 'phone_number'],
+                    attributes: ['id', 'name', 'email', 'phone_number', 'address1', 'address2', 'address3', 'is_primary_account_contact'],
                     required: false
                 },
                 {
@@ -459,6 +827,8 @@ exports.updateAccount = async (accountId, params, org_id, user_id, user_type, ne
         if (params.postal_code !== undefined) updateData.postal_code = params.postal_code;
         if (params.source !== undefined) updateData.source = params.source;
         if (params.account_type !== undefined) updateData.account_type = params.account_type;
+
+        updateData.updatedAt = Sequelize.literal('CURRENT_TIMESTAMP');
 
         await account.update(updateData);
 
@@ -552,6 +922,138 @@ exports.deleteAccount = async (accountId, org_id, next) => {
             success: false, 
             message: error.message || "Failed to delete account", 
             status: 500 
+        };
+    }
+};
+
+// Soft Delete Account
+exports.softDeleteAccount = async (accountId, org_id, user_id, next) => {
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        const whereClause = { 
+            id: accountId,
+            org_id: org_id 
+        };
+
+        const account = await db.Account.findOne({ 
+            where: whereClause
+        });
+
+        if (!account) {
+            return { 
+                success: false, 
+                message: 'Account not found', 
+                status: 404 
+            };
+        }
+
+        // Update deleted_flag to 1
+        await account.update({ 
+            deleted_flag: 1,
+            updated_at: new Date()
+        });
+
+        logger.info("*** Ending %s of %s ***", getName().functionName, getName().fileName);
+        return { 
+            success: true, 
+            message: 'Account soft deleted successfully',
+            data: account.toJSON()
+        };
+
+    } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        return { 
+            success: false, 
+            message: error.message || "Failed to soft delete account", 
+            status: 500 
+        };
+    }
+};
+
+// Set or Switch Primary Contact for Account
+exports.setPrimaryContact = async (params, org_id, user_id, next) => {
+    logger.info("*** Starting %s of %s ***", getName().functionName, getName().fileName);
+    try {
+        const { account_id, customer_id } = params;
+
+        // Validate required parameters
+        if (!account_id || !customer_id) {
+            return {
+                success: false,
+                message: 'account_id and customer_id are required',
+                status: 400
+            };
+        }
+
+        // Verify account exists and belongs to the organization
+        const account = await db.Account.findOne({
+            where: {
+                id: account_id,
+                org_id: org_id
+            }
+        });
+
+        if (!account) {
+            return {
+                success: false,
+                message: 'Account not found',
+                status: 404
+            };
+        }
+
+        // Verify customer exists and belongs to the account
+        const customer = await db.Customer.findOne({
+            where: {
+                id: customer_id,
+                account_id: account_id,
+                org_id: org_id
+            }
+        });
+
+        if (!customer) {
+            return {
+                success: false,
+                message: 'Customer not found or does not belong to this account',
+                status: 404
+            };
+        }
+
+        // First, remove primary status from all customers in this account
+        await db.Customer.update(
+            { is_primary_account_contact: 0 },
+            {
+                where: {
+                    account_id: account_id,
+                    org_id: org_id
+                }
+            }
+        );
+
+        // Now set the specified customer as primary contact
+        await customer.update({
+            is_primary_account_contact: 1,
+            updated_at: new Date()
+        });
+
+        logger.info("*** Ending %s of %s ***", getName().functionName, getName().fileName);
+        return {
+            success: true,
+            message: 'Customer set as primary contact',
+            data: {
+                customer_id: customer.id,
+                account_id: account.id,
+                is_primary_account_contact: 1
+            }
+        };
+
+    } catch (error) {
+        logger.error("*** Error in %s of %s ***", getName().functionName, getName().fileName);
+        logger.error(error.message || JSON.stringify(error));
+        return {
+            success: false,
+            message: error.message || "Failed to set primary contact",
+            status: 500
         };
     }
 };
